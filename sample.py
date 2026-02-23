@@ -32,8 +32,9 @@ import torch
 from tqdm import tqdm
 
 from src.models import create_model_from_config
-from src.data import save_image
-from src.methods import DDPM
+from src.data import save_image, unnormalize
+from src.methods import DDPM, FlowMatching, CfgDDPM
+from src.data import CELEBA_ATTRIBUTES
 from src.utils import EMA
 
 
@@ -56,18 +57,20 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
 def save_samples(
     samples: torch.Tensor,
     save_path: str,
-    num_samples: int,
+    nrow: int = 8,
 ) -> None:
     """
-    TODO: save generated samples as images.
+    Save generated samples as an image grid.
 
     Args:
-        samples: Generated samples tensor with shape (num_samples, C, H, W).
+        samples: Generated samples tensor (num_samples, C, H, W) in [-1, 1].
         save_path: File path to save the image grid.
-        num_samples: Number of samples, used to calculate grid layout.
+        nrow: Number of images per row in the grid.
     """
-
-    raise NotImplementedError
+    # Convert from [-1, 1] to [0, 1]
+    samples = unnormalize(samples)
+    samples = torch.clamp(samples, 0, 1)
+    save_image(samples, save_path, nrow=nrow)
 
 
 def main():
@@ -75,8 +78,8 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to model checkpoint')
     parser.add_argument('--method', type=str, required=True,
-                       choices=['ddpm'], # You can add more later
-                       help='Method used for training (currently only ddpm is supported)')
+                       choices=['ddpm', 'flow_matching', 'cfg_ddpm'],
+                       help='Method used for training (ddpm, flow_matching, or cfg_ddpm)')
     parser.add_argument('--num_samples', type=int, default=64,
                        help='Number of samples to generate')
     parser.add_argument('--output_dir', type=str, default='samples',
@@ -93,6 +96,26 @@ def main():
     # Sampling arguments
     parser.add_argument('--num_steps', type=int, default=None,
                        help='Number of sampling steps (default: from config)')
+    parser.add_argument('--sampler', type=str, default='ddpm',
+                       choices=['ddpm', 'ddim'],
+                       help='Sampler to use for DDPM models (ddpm or ddim)')
+    
+    # CFG-specific arguments
+    parser.add_argument('--guidance_scale', type=float, default=None,
+                       help='Classifier-free guidance scale (default: from config)')
+    parser.add_argument('--attributes', type=str, default=None,
+                       help='Comma-separated CelebA attributes to condition on (e.g., "Smiling,Young,Male")')
+
+    # Attribute-Contrastive CFG arguments
+    parser.add_argument('--contrastive', action='store_true',
+                       help='Use attribute-contrastive CFG instead of standard CFG. '
+                            'Requires --focal_attributes to specify which attribute(s) to isolate.')
+    parser.add_argument('--focal_attributes', type=str, default=None,
+                       help='Comma-separated attributes to isolate via contrastive guidance. '
+                            'The anchor condition is constructed by flipping these attributes '
+                            'relative to --attributes. Positive focal attrs (set to 1 in --attributes) '
+                            'guide toward the attribute; negative focal attrs (set to 0) suppress it. '
+                            'Example: --attributes "Eyeglasses,Male,Young" --focal_attributes "Eyeglasses"')
     
     # Other options
     parser.add_argument('--no_ema', action='store_true',
@@ -119,8 +142,48 @@ def main():
     # Create method
     if args.method == 'ddpm':
         method = DDPM.from_config(model, config, device)
+    elif args.method == 'flow_matching':
+        method = FlowMatching.from_config(model, config, device)
+    elif args.method == 'cfg_ddpm':
+        method = CfgDDPM.from_config(model, config, device)
     else:
-        raise ValueError(f"Unknown method: {args.method}. Only 'ddpm' is currently supported.")
+        raise ValueError(f"Unknown method: {args.method}. Supported: 'ddpm', 'flow_matching', 'cfg_ddpm'")
+    
+    # Build condition tensor for CFG models
+    cfg_cond = None
+    cfg_cond_anchor = None
+    if args.method == 'cfg_ddpm':
+        num_classes = config.get('model', {}).get('num_classes', 40)
+        cfg_cond = torch.zeros(args.num_samples, num_classes, device=device)
+        if args.attributes:
+            attr_list = [a.strip() for a in args.attributes.split(',')]
+            for attr in attr_list:
+                if attr in CELEBA_ATTRIBUTES:
+                    idx = CELEBA_ATTRIBUTES.index(attr)
+                    cfg_cond[:, idx] = 1.0
+                else:
+                    print(f"Warning: Unknown attribute '{attr}'. Available: {CELEBA_ATTRIBUTES}")
+            print(f"Conditioning on: {attr_list}")
+        else:
+            print("No attributes specified, generating unconditionally")
+
+        # Build anchor condition for contrastive CFG
+        if args.contrastive:
+            if not args.focal_attributes:
+                raise ValueError("--contrastive requires --focal_attributes to specify which attribute(s) to isolate.")
+            focal_list = [a.strip() for a in args.focal_attributes.split(',')]
+            # Start from the target condition and flip each focal attribute
+            cfg_cond_anchor = cfg_cond.clone()
+            for attr in focal_list:
+                if attr in CELEBA_ATTRIBUTES:
+                    idx = CELEBA_ATTRIBUTES.index(attr)
+                    # Flip: 1 → 0 (positive isolation) or 0 → 1 (negative suppression)
+                    cfg_cond_anchor[:, idx] = 1.0 - cfg_cond_anchor[:, idx]
+                else:
+                    print(f"Warning: Unknown focal attribute '{attr}'. Available: {CELEBA_ATTRIBUTES}")
+            print(f"Contrastive CFG enabled. Focal attribute(s): {focal_list}")
+            print(f"  Target:  {dict(zip(attr_list, cfg_cond[0, [CELEBA_ATTRIBUTES.index(a) for a in attr_list if a in CELEBA_ATTRIBUTES]].tolist()))}")
+            print(f"  Anchor:  focal attrs flipped")
     
     # Apply EMA weights
     if not args.no_ema:
@@ -151,14 +214,29 @@ def main():
         while remaining > 0:
             batch_size = min(args.batch_size, remaining)
 
-            num_steps = args.num_steps or config['sampling']['num_steps']
+            num_steps = args.num_steps or config.get('sampling', {}).get('num_steps', 100)
 
-            samples = method.sample(
-                batch_size=batch_size,
-                image_shape=image_shape,
-                num_steps=num_steps,
-                # TODO: add your arugments here
-            )
+            # Build sampling kwargs
+            sample_kwargs = {
+                'batch_size': batch_size,
+                'image_shape': image_shape,
+                'num_steps': num_steps,
+            }
+            
+            # Add sampler argument (applies to both ddpm and cfg_ddpm)
+            if args.method in ('ddpm', 'cfg_ddpm'):
+                sample_kwargs['sampler'] = args.sampler
+
+            # Add CFG-specific arguments
+            if args.method == 'cfg_ddpm':
+                if cfg_cond is not None:
+                    sample_kwargs['cond'] = cfg_cond[sample_idx:sample_idx + batch_size]
+                if cfg_cond_anchor is not None:
+                    sample_kwargs['cond_anchor'] = cfg_cond_anchor[sample_idx:sample_idx + batch_size]
+                if args.guidance_scale is not None:
+                    sample_kwargs['guidance_scale'] = args.guidance_scale
+
+            samples = method.sample(**sample_kwargs)
 
             # Save individual images immediately or collect for grid
             if args.grid:
@@ -166,7 +244,7 @@ def main():
             else:
                 for i in range(samples.shape[0]):
                     img_path = os.path.join(args.output_dir, f"{sample_idx:06d}.png")
-                    save_samples(samples, img_path, 1)
+                    save_samples(samples[i:i+1], img_path, 1)  # Save individual sample
                     sample_idx += 1
 
             remaining -= batch_size

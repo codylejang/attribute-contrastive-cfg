@@ -42,7 +42,7 @@ from tqdm import tqdm
 
 from src.models import UNet, create_model_from_config
 from src.data import create_dataloader_from_config, save_image, unnormalize
-from src.methods import DDPM
+from src.methods import DDPM, FlowMatching, CfgDDPM
 from src.utils import EMA
 
 import wandb
@@ -206,29 +206,26 @@ def generate_samples(
     config: dict,
     ema: Optional[EMA] = None,
     current_step: Optional[int] = None,
-    # TODO: add/delete your arguments here
+    num_steps: Optional[int] = None,
     **sampling_kwargs,
 ) -> torch.Tensor:
     """
     Generate samples using EMA parameters if available.
 
-    TODO: incoporate your own sampling scheme here
-
     Args:
-        method: The diffusion method object (e.g., DDPM) with sample() and eval/train mode methods.
-        num_samples: Number of samples to generate.
-        image_shape: Shape of each image as (channels, height, width).
-        device: The torch device to generate samples on.
-        method_name: Name of the method being used (e.g., 'ddpm').
-        config: Configuration dictionary containing training and model settings.
-        ema: Optional EMA wrapper for the model. If provided and conditions are met,
-            EMA parameters will be used during sampling.
-        current_step: Current training step. Used to determine if EMA should be applied
-            based on ema_start config.
-        **sampling_kwargs: Additional keyword arguments passed to method.sample().
+        method: Diffusion method object (e.g., DDPM)
+        num_samples: Number of samples to generate
+        image_shape: Shape of each image (channels, height, width)
+        device: Torch device
+        method_name: Method name (e.g., 'ddpm')
+        config: Configuration dictionary
+        ema: Optional EMA wrapper
+        current_step: Current training step
+        num_steps: Number of sampling steps (default: from config)
+        **sampling_kwargs: Additional arguments for method.sample()
 
     Returns:
-        torch.Tensor: Generated samples with shape (num_samples, *image_shape).
+        Generated samples (num_samples, *image_shape)
     """
     method.eval_mode()
 
@@ -237,8 +234,29 @@ def generate_samples(
     if use_ema:
         ema.apply_shadow()
 
-    samples = None
-    # TODO: sample with your method.sample()
+    if num_steps is None:
+        default_steps = getattr(method, 'num_timesteps', 100)  # 100 for flow matching
+        num_steps = config.get('sampling', {}).get('num_steps', default_steps)
+    
+    # For CFG models, generate with a sample condition during training preview
+    if hasattr(method, 'guidance_scale') and 'cond' not in sampling_kwargs:
+        from src.data import CELEBA_ATTRIBUTES
+        num_classes = config.get('model', {}).get('num_classes', 0)
+        if num_classes > 0:
+            # Generate with "Smiling, Young, Female" condition for preview
+            cond = torch.zeros(num_samples, num_classes, device=device)
+            smiling_idx = CELEBA_ATTRIBUTES.index('Smiling')
+            young_idx = CELEBA_ATTRIBUTES.index('Young')
+            cond[:, smiling_idx] = 1.0
+            cond[:, young_idx] = 1.0
+            sampling_kwargs['cond'] = cond
+
+    samples = method.sample(
+        batch_size=num_samples,
+        image_shape=image_shape,
+        num_steps=num_steps,
+        **sampling_kwargs,
+    )
 
     if use_ema:
         ema.restore()
@@ -253,15 +271,19 @@ def save_samples(
     num_samples: int,
 ) -> None:
     """
-    TODO: save generated samples as images.
+    Save generated samples as an image grid.
 
     Args:
-        samples: Generated samples tensor with shape (num_samples, C, H, W).
-        save_path: File path to save the image grid.
-        num_samples: Number of samples, used to calculate grid layout.
+        samples: Generated samples (num_samples, C, H, W) in [-1, 1]
+        save_path: File path to save the image grid
+        num_samples: Number of samples for grid layout
     """
-
-    raise NotImplementedError
+    # Convert from [-1, 1] to [0, 1]
+    samples = unnormalize(samples)
+    samples = torch.clamp(samples, 0, 1)
+    
+    nrow = int(math.sqrt(num_samples))
+    save_image(samples, save_path, nrow=nrow)
 
 
 def train(
@@ -397,8 +419,12 @@ def train(
         print(f"Creating {method_name}...")
     if method_name == 'ddpm':
         method = DDPM.from_config(model, config, device)
+    elif method_name == 'flow_matching':
+        method = FlowMatching.from_config(model, config, device)
+    elif method_name == 'cfg_ddpm':
+        method = CfgDDPM.from_config(model, config, device)
     else:
-        raise ValueError(f"Unknown method: {method_name}. Only 'ddpm' is currently supported.")
+        raise ValueError(f"Unknown method: {method_name}. Supported: 'ddpm', 'flow_matching', 'cfg_ddpm'")
 
     # Create optimizer
     optimizer = create_optimizer(model, config) # default to AdamW optimizer
@@ -465,31 +491,38 @@ def train(
     if sampler is not None:
         sampler.set_epoch(epoch)
 
-    # Pro tips: before big training runs, it's usually a good idea to sanity check 
-    # by overfitting to a single batch with a small number of training iterations
+    # Determine if we are doing conditional training
+    is_conditional = method_name == 'cfg_ddpm'
+
     # For single batch overfitting, grab one batch and reuse it
     single_batch = None
-    single_batch_base = None  # Store the original small batch
+    single_batch_labels = None
+    single_batch_base = None
     if overfit_single_batch:
-        single_batch_base = next(data_iter)
-        if isinstance(single_batch_base, (tuple, list)):
-            single_batch_base = single_batch_base[0]  # Handle (image, label) tuples
-        single_batch_base = single_batch_base.to(device)
+        raw_batch = next(data_iter)
+        if isinstance(raw_batch, (tuple, list)) and len(raw_batch) == 2 and is_conditional:
+            single_batch_base = raw_batch[0].to(device)
+            single_batch_labels_base = raw_batch[1].to(device)
+        else:
+            if isinstance(raw_batch, (tuple, list)):
+                single_batch_base = raw_batch[0].to(device)
+            else:
+                single_batch_base = raw_batch.to(device)
+            single_batch_labels_base = None
 
-        # Replicate to match desired batch size
         base_batch_size = single_batch_base.shape[0]
         desired_batch_size = training_config['batch_size']
 
         if desired_batch_size > base_batch_size:
-            # Replicate the batch to reach desired size
             num_repeats = (desired_batch_size + base_batch_size - 1) // base_batch_size
             single_batch = single_batch_base.repeat(num_repeats, 1, 1, 1)[:desired_batch_size]
+            if single_batch_labels_base is not None:
+                single_batch_labels = single_batch_labels_base.repeat(num_repeats, 1)[:desired_batch_size]
             if is_main_process:
                 print(f"Cached single batch: {base_batch_size} samples replicated to {desired_batch_size}")
-                print(f"  Base batch shape: {single_batch_base.shape}")
-                print(f"  Training batch shape: {single_batch.shape}")
         else:
             single_batch = single_batch_base
+            single_batch_labels = single_batch_labels_base
             if is_main_process:
                 print(f"Cached single batch with shape: {single_batch.shape}")
 
@@ -505,28 +538,38 @@ def train(
     )
     for step in pbar:
         # Get batch (cycle through dataset or use single batch)
+        labels = None
         if overfit_single_batch:
             batch = single_batch
+            labels = single_batch_labels
         else:
             try:
-                batch = next(data_iter)
+                raw_batch = next(data_iter)
             except StopIteration:
                 epoch += 1
                 if sampler is not None:
                     sampler.set_epoch(epoch)
                 data_iter = iter(dataloader)
-                batch = next(data_iter)
+                raw_batch = next(data_iter)
 
-            if isinstance(batch, (tuple, list)):
-                batch = batch[0]  # Handle (image, label) tuples
-
-            batch = batch.to(device)
+            if isinstance(raw_batch, (tuple, list)) and len(raw_batch) == 2 and is_conditional:
+                batch = raw_batch[0].to(device)
+                labels = raw_batch[1].to(device)
+            elif isinstance(raw_batch, (tuple, list)):
+                batch = raw_batch[0].to(device)
+            else:
+                batch = raw_batch.to(device)
         
         # Forward pass with mixed precision
         optimizer.zero_grad()
         
+        # Build kwargs for compute_loss
+        loss_kwargs = {}
+        if is_conditional and labels is not None:
+            loss_kwargs['cond'] = labels
+
         with autocast(device_type, enabled=config['infrastructure']['mixed_precision']):
-            loss, metrics = method.compute_loss(batch)
+            loss, metrics = method.compute_loss(batch, **loss_kwargs)
         
         # Backward pass
         scaler.scale(loss).backward()
@@ -658,8 +701,8 @@ def train(
 def main():
     parser = argparse.ArgumentParser(description='Train diffusion models')
     parser.add_argument('--method', type=str, required=True,
-                       choices=['ddpm'], # You can add more later
-                       help='Method to train (currently only ddpm is supported)')
+                       choices=['ddpm', 'flow_matching', 'cfg_ddpm'],
+                       help='Method to train (ddpm, flow_matching, or cfg_ddpm)')
     parser.add_argument('--config', type=str, required=True,
                        help='Path to config file (e.g., configs/ddpm.yaml)')
     parser.add_argument('--resume', type=str, default=None,

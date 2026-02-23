@@ -1,10 +1,11 @@
 """
 U-Net Architecture for Diffusion Models
 
-In this file, you should implements a U-Net architecture suitable for DDPM.
+Implements a U-Net architecture suitable for DDPM, with optional
+class/attribute conditioning for classifier-free guidance.
 
 Architecture Overview:
-    Input: (batch_size, channels, H, W), timestep
+    Input: (batch_size, channels, H, W), timestep, [optional condition]
     
     Encoder (Downsampling path)
 
@@ -32,7 +33,7 @@ from .blocks import (
 
 class UNet(nn.Module):
     """
-    TODO: design your own U-Net architecture for diffusion models.
+    U-Net architecture for diffusion models with optional conditioning.
 
     Args:
         in_channels: Number of input image channels (3 for RGB)
@@ -46,6 +47,8 @@ class UNet(nn.Module):
         num_heads: Number of attention heads
         dropout: Dropout probability
         use_scale_shift_norm: Whether to use FiLM conditioning in ResBlocks
+        num_classes: Number of class labels for conditioning (0 = unconditional)
+        cond_embed_dim: Dimension of condition embedding (if num_classes > 0)
     
     Example:
         >>> model = UNet(
@@ -55,10 +58,12 @@ class UNet(nn.Module):
         ...     channel_mult=(1, 2, 2, 4),
         ...     num_res_blocks=2,
         ...     attention_resolutions=[16, 8],
+        ...     num_classes=40,
         ... )
         >>> x = torch.randn(4, 3, 64, 64)
         >>> t = torch.randint(0, 1000, (4,))
-        >>> out = model(x, t)
+        >>> cond = torch.randint(0, 2, (4, 40)).float()
+        >>> out = model(x, t, cond=cond)
         >>> out.shape
         torch.Size([4, 3, 64, 64])
     """
@@ -74,6 +79,8 @@ class UNet(nn.Module):
         num_heads: int = 4,
         dropout: float = 0.1,
         use_scale_shift_norm: bool = True,
+        num_classes: int = 0,
+        cond_embed_dim: int = 0,
     ):
         super().__init__()
         
@@ -86,33 +93,173 @@ class UNet(nn.Module):
         self.num_heads = num_heads
         self.dropout = dropout
         self.use_scale_shift_norm = use_scale_shift_norm
+        self.num_classes = num_classes
         
-        # TODO: build your own unet architecture here
-        # Pro tips: remember to take care of the time embeddings!
+        # Time embedding
+        time_embed_dim = base_channels * 4
+        self.time_embed = TimestepEmbedding(time_embed_dim)
+        
+        # Condition embedding: maps attribute vector to time_embed_dim
+        if num_classes > 0:
+            cond_input_dim = cond_embed_dim if cond_embed_dim > 0 else num_classes
+            self.cond_embed = nn.Sequential(
+                nn.Linear(cond_input_dim, time_embed_dim),
+                nn.SiLU(),
+                nn.Linear(time_embed_dim, time_embed_dim),
+            )
+        else:
+            self.cond_embed = None
+        
+        # Initial convolution
+        self.conv_in = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
+        
+        # Build encoder
+        # We'll store everything in a flat ModuleList but track structure
+        self.input_blocks = nn.ModuleList()
+        
+        ch = base_channels
+        input_block_chans = [ch]  # Track channels for skip connections
+        current_resolution = 64
+        num_levels = len(channel_mult)
+        
+        for level in range(num_levels):
+            mult = channel_mult[level]
+            out_ch = base_channels * mult
+            
+            for _ in range(num_res_blocks):
+                layers = nn.ModuleList([
+                    ResBlock(ch, out_ch, time_embed_dim, dropout, use_scale_shift_norm)
+                ])
+                ch = out_ch
+                
+                if current_resolution in attention_resolutions:
+                    layers.append(AttentionBlock(ch, num_heads))
+                
+                self.input_blocks.append(layers)
+                input_block_chans.append(ch)
+            
+            # Downsample (except at the last level)
+            if level != num_levels - 1:
+                self.input_blocks.append(nn.ModuleList([Downsample(ch)]))
+                input_block_chans.append(ch)
+                current_resolution //= 2
+        
+        # Middle block
+        self.middle_block = nn.ModuleList([
+            ResBlock(ch, ch, time_embed_dim, dropout, use_scale_shift_norm),
+            AttentionBlock(ch, num_heads),
+            ResBlock(ch, ch, time_embed_dim, dropout, use_scale_shift_norm),
+        ])
+        
+        # Build decoder
+        self.output_blocks = nn.ModuleList()
+        
+        for level in reversed(range(num_levels)):
+            mult = channel_mult[level]
+            out_ch = base_channels * mult
+            
+            for i in range(num_res_blocks + 1):
+                # Pop the channel count for the skip connection
+                skip_ch = input_block_chans.pop()
+                
+                layers = nn.ModuleList([
+                    ResBlock(ch + skip_ch, out_ch, time_embed_dim, dropout, use_scale_shift_norm)
+                ])
+                ch = out_ch
+                
+                if current_resolution in attention_resolutions:
+                    layers.append(AttentionBlock(ch, num_heads))
+                
+                # Upsample at the end of each level (except the last level in original order)
+                if level > 0 and i == num_res_blocks:
+                    layers.append(Upsample(ch))
+                    current_resolution *= 2
+                
+                self.output_blocks.append(layers)
+        
+        # Output
+        self.out_norm = GroupNorm32(32, ch)
+        self.out_conv = nn.Conv2d(ch, out_channels, kernel_size=3, padding=1)
+        
+        # Initialize weights
+        self._initialize_weights()
     
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def _initialize_weights(self):
+        """Initialize weights - using PyTorch defaults which work with AMP."""
+        # PyTorch default initialization is reasonable for conv/linear
+        # Just ensure GroupNorm is properly set
+        for module in self.modules():
+            if isinstance(module, nn.GroupNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+    
+    def forward(self, x: torch.Tensor, t: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        TODO: Implement the forward pass of the unet
+        Forward pass of the U-Net.
         
         Args:
-            x: Input tensor of shape (batch_size, in_channels, height, width)
-               This is typically the noisy image x_t
-            t: Timestep tensor of shape (batch_size,)
+            x: Input tensor (batch_size, in_channels, height, width)
+            t: Timestep tensor (batch_size,)
+            cond: Optional condition tensor (batch_size, num_classes) for CFG
 
         Returns:
-            Output tensor of shape (batch_size, out_channels, height, width)
+            Output tensor (batch_size, out_channels, height, width)
         """
-
-        raise NotImplementedError
+        # Time embedding
+        t_emb = self.time_embed(t)
+        
+        # Add condition embedding if provided
+        if self.cond_embed is not None and cond is not None:
+            cond_emb = self.cond_embed(cond.float())
+            t_emb = t_emb + cond_emb
+        
+        # Initial convolution
+        h = self.conv_in(x)
+        
+        # Store skip connections
+        hs = [h]
+        
+        # Encoder
+        for block in self.input_blocks:
+            for layer in block:
+                if isinstance(layer, ResBlock):
+                    h = layer(h, t_emb)
+                else:
+                    h = layer(h)
+            hs.append(h)
+        
+        # Middle
+        for layer in self.middle_block:
+            if isinstance(layer, ResBlock):
+                h = layer(h, t_emb)
+            else:
+                h = layer(h)
+        
+        # Decoder
+        for block in self.output_blocks:
+            # Pop skip connection and concatenate
+            h = torch.cat([h, hs.pop()], dim=1)
+            
+            for layer in block:
+                if isinstance(layer, ResBlock):
+                    h = layer(h, t_emb)
+                else:
+                    h = layer(h)
+        
+        # Output
+        h = self.out_norm(h)
+        h = F.silu(h)
+        h = self.out_conv(h)
+        
+        return h
 
 
 def create_model_from_config(config: dict) -> UNet:
     """
-    Factory function to create a UNet from a configuration dictionary.
+    Create a UNet from a configuration dictionary.
     
     Args:
-        config: Dictionary containing model configuration
-                Expected to have a 'model' key with the relevant parameters
+        config: Dictionary with model configuration
     
     Returns:
         Instantiated UNet model
@@ -130,6 +277,8 @@ def create_model_from_config(config: dict) -> UNet:
         num_heads=model_config['num_heads'],
         dropout=model_config['dropout'],
         use_scale_shift_norm=model_config['use_scale_shift_norm'],
+        num_classes=model_config.get('num_classes', 0),
+        cond_embed_dim=model_config.get('cond_embed_dim', 0),
     )
 
 

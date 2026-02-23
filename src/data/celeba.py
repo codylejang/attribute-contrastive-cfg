@@ -5,10 +5,7 @@ This module handles loading and preprocessing the CelebA dataset for
 training diffusion models. It includes:
 - Loading from HuggingFace Hub (electronickale/cmu-10799-celeba64-subset)
 - Loading from local directory (downloaded datasets)
-
-What you need to implement:
-- Data preprocessing and postprocessing transform functions
-- Data augmentations if needed
+- Optional attribute label return for conditional generation
 """
 
 import os
@@ -21,6 +18,19 @@ from torchvision.transforms import functional as TF
 from torchvision.utils import make_grid as torch_make_grid
 from torchvision.utils import save_image as torch_save_image
 from PIL import Image
+
+
+# All 40 CelebA attributes in order
+CELEBA_ATTRIBUTES = [
+    '5_o_Clock_Shadow', 'Arched_Eyebrows', 'Attractive', 'Bags_Under_Eyes',
+    'Bald', 'Bangs', 'Big_Lips', 'Big_Nose', 'Black_Hair', 'Blond_Hair',
+    'Blurry', 'Brown_Hair', 'Bushy_Eyebrows', 'Chubby', 'Double_Chin',
+    'Eyeglasses', 'Goatee', 'Gray_Hair', 'Heavy_Makeup', 'High_Cheekbones',
+    'Male', 'Mouth_Slightly_Open', 'Mustache', 'Narrow_Eyes', 'No_Beard',
+    'Oval_Face', 'Pale_Skin', 'Pointy_Nose', 'Receding_Hairline', 'Rosy_Cheeks',
+    'Sideburns', 'Smiling', 'Straight_Hair', 'Wavy_Hair', 'Wearing_Earrings',
+    'Wearing_Hat', 'Wearing_Lipstick', 'Wearing_Necklace', 'Wearing_Necktie', 'Young',
+]
 
 
 class CelebADataset(Dataset):
@@ -38,6 +48,7 @@ class CelebADataset(Dataset):
         augment: Whether to apply data augmentation
         from_hub: Whether to load from HuggingFace Hub (default: False, loads locally)
         repo_name: HuggingFace repo name (default: "electronickale/cmu-10799-celeba64-subset")
+        return_labels: Whether to return attribute labels alongside images
     """
 
     def __init__(
@@ -48,6 +59,7 @@ class CelebADataset(Dataset):
         augment: bool = True,
         from_hub: bool = False,
         repo_name: str = "electronickale/cmu-10799-celeba64-subset",
+        return_labels: bool = False,
     ):
         self.root = root
         self.split = split
@@ -55,9 +67,10 @@ class CelebADataset(Dataset):
         self.augment = augment
         self.from_hub = from_hub
         self.repo_name = repo_name
+        self.return_labels = return_labels
 
         # Build transforms
-        self.transform = self._build_transforms() # TODO write your own image transform function
+        self.transform = self._build_transforms()
 
         # Load dataset based on mode
         if from_hub:
@@ -235,46 +248,55 @@ class CelebADataset(Dataset):
         """Build the preprocessing transforms."""
         transform_list = []
 
-        # TODO: write your image transforms & augmentation
-
-        # Only resize if needed (dataset images are already 64x64)
-
-        # For Data augmentation you can do something like
-        # if self.augment and self.split == "train":
-        #     transform_list.append(...)
+        # Resize if needed
+        if self.image_size != 64:
+            transform_list.append(transforms.Resize(self.image_size))
+        
+        # Data augmentation
+        if self.augment and self.split == "train":
+            transform_list.append(transforms.RandomHorizontalFlip(p=0.5))
+        
+        # Convert to tensor
+        transform_list.append(transforms.ToTensor())
+        
+        # Normalize to [-1, 1]
+        transform_list.append(transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]))
 
         return transforms.Compose(transform_list)
 
     def __len__(self) -> int:
         return len(self.data)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
+    def __getitem__(self, idx: int):
         """
-        Get a single image.
+        Get a single image, optionally with attribute labels.
 
         Args:
             idx: Index of the image
 
         Returns:
-            Image tensor of shape (3, image_size, image_size) in range [-1, 1]
-
-        Note:
-            We only return the image, not the attributes, since we're doing
-            unconditional generation.
+            If return_labels=False: Image tensor (3, image_size, image_size) in [-1, 1]
+            If return_labels=True: (image, labels) where labels is (num_attributes,) float tensor
         """
         item = self.data[idx]
 
         # Load image
         if self.from_hub:
-            # HuggingFace datasets provide PIL images directly
             image = item["image"]
         else:
-            # Local mode: load from file path
             image = Image.open(item["image"]).convert("RGB")
 
         # Apply transforms
         if self.transform:
             image = self.transform(image)
+
+        if self.return_labels:
+            # Extract attribute labels as a float tensor
+            labels = torch.tensor(
+                [float(item.get(attr, 0)) for attr in CELEBA_ATTRIBUTES],
+                dtype=torch.float32,
+            )
+            return image, labels
 
         return image
 
@@ -291,6 +313,7 @@ def create_dataloader(
     drop_last: bool = True,
     from_hub: bool = False,
     repo_name: str = "electronickale/cmu-10799-celeba64-subset",
+    return_labels: bool = False,
 ) -> DataLoader:
     """
     Create a DataLoader for CelebA.
@@ -307,6 +330,7 @@ def create_dataloader(
         drop_last: Whether to drop the last incomplete batch
         from_hub: Whether to load from HuggingFace Hub (default: False)
         repo_name: HuggingFace repo name (default: "electronickale/cmu-10799-celeba64-subset")
+        return_labels: Whether to return attribute labels alongside images
 
     Returns:
         DataLoader instance
@@ -318,6 +342,7 @@ def create_dataloader(
         augment=augment,
         from_hub=from_hub,
         repo_name=repo_name,
+        return_labels=return_labels,
     )
 
     if shuffle is None:
@@ -359,6 +384,7 @@ def create_dataloader_from_config(config: dict, split: str = "train") -> DataLoa
         augment=(split == "train" and data_config.get('augment', True)),
         from_hub=data_config.get('from_hub', False),
         repo_name=data_config.get('repo_name', 'electronickale/cmu-10799-celeba64-subset'),
+        return_labels=data_config.get('return_labels', False),
     )
 
 """
