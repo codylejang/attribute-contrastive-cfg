@@ -8,8 +8,8 @@ This repository implements **Attribute-Contrastive CFG**, an improved classifier
 
 ### Key Results
 
-- **16.8% KID improvement** (0.0316 → 0.0263) on CelebA attribute-conditioned generation
-- **Better guidance-scale stability**: No mode collapse at high guidance scales (w=7)
+- **9.4% KID improvement at w=2** (0.0364 → 0.0330), **45.4% at w=7** (0.0777 → 0.0424, >4σ) on CelebA attribute-conditioned generation
+- **Better guidance-scale stability**: Standard CFG degrades 151% from w=1→7, contrastive only 37%
 - **Zero computational overhead**: Same 2 forward passes as standard CFG, no retraining required
 - **Unified framework**: Supports both positive attribute guidance and negative attribute suppression
 
