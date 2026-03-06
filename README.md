@@ -6,8 +6,11 @@ Attribute-Contrastive Classifier-Free Guidance (CFG) for diffusion models. Repla
 
 This repository implements **Attribute-Contrastive CFG**, an improved classifier-free guidance method for diffusion models. The key innovation is replacing the standard null-condition baseline with targeted attribute anchors that isolate the causal effect of specific attributes, reducing spurious correlations in the guidance direction.
 
-### Key Results
+[link full poster pdf](./diffusion%20final.pdf)
 
+![Poster preview](./diffusion%20final.png)
+
+### Key Results
 - **9.4% KID improvement at w=2** (0.0364 → 0.0330), **45.4% at w=7** (0.0777 → 0.0424, >4σ) on CelebA attribute-conditioned generation
 - **Better guidance-scale stability**: Standard CFG degrades 151% from w=1→7, contrastive only 37%
 - **Zero computational overhead**: Same 2 forward passes as standard CFG, no retraining required
